@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import multiprocessing as mp
+import os
+import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
 import torch
-from rdkit import Chem
+import yaml
+from rdkit import Chem, RDLogger
 from torch_geometric.data import HeteroData
 from tqdm import tqdm
 
 from bapred2.config import GraphConfig, load_config
 from .features import add_spatial_edges, atom_property_masks, bonded_edges, coords_tensor, local_direction, node_feature_tensor, random_walk_pe, rbf_distance
+
+# Manifest contract (SPEC 14.1). ``pKd`` is accepted as an alias of ``affinity``; ``pocket_path`` and
+# ``ligand_alt_path`` are optional accelerators/fallbacks produced by scripts/make_pdbbind_manifest.py.
+REQUIRED_COLUMNS = ("id", "protein_path", "ligand_path")
+TARGET_ALIASES = ("affinity", "pKd")
 
 
 def _load_ligand(path: str | Path) -> Chem.Mol:
@@ -133,40 +143,125 @@ class ComplexPreprocessor:
         data.sample_id = str(sample_id)
         return data
 
+    def build_with_fallback(self, protein_path: str | Path, ligand_candidates: list[str | Path], affinity: float, sample_id: str) -> tuple[HeteroData, Path]:
+        """Try ligand files in order (typically ``.sdf`` then ``.mol2``); RDKit rejects a sizeable fraction of PDBbind SDF files."""
+        errors = []
+        for cand in ligand_candidates:
+            cand = Path(cand)
+            if not cand.is_file():
+                errors.append(f"{cand.name}: missing")
+                continue
+            try:
+                return self.build(protein_path, cand, affinity, sample_id), cand
+            except Exception as exc:
+                errors.append(f"{cand.name}: {exc}")
+        raise ValueError("; ".join(errors) if errors else "no ligand candidates")
 
-def preprocess_manifest(manifest: str | Path, out_dir: str | Path, cfg: GraphConfig) -> Path:
+
+def _resolve(path_value, base: Path) -> Path | None:
+    if path_value is None or (isinstance(path_value, float) and pd.isna(path_value)) or str(path_value).strip() in {"", "nan"}:
+        return None
+    p = Path(str(path_value))
+    return p if p.is_absolute() else (base / p).resolve()
+
+
+def _read_manifest(manifest: Path) -> pd.DataFrame:
+    df = pd.read_csv(manifest, dtype={"id": str})
+    missing = set(REQUIRED_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Manifest missing columns: {sorted(missing)}")
+    target_col = next((c for c in TARGET_ALIASES if c in df.columns), None)
+    if target_col is None:
+        raise ValueError(f"Manifest needs one of {TARGET_ALIASES} as the affinity column")
+    if target_col != "affinity":
+        df = df.rename(columns={target_col: "affinity"})
+    if "split" not in df.columns:
+        df["split"] = "train"
+    return df
+
+
+_WORKER_CFG: GraphConfig | None = None
+
+
+def _worker_init(cfg: GraphConfig):
+    global _WORKER_CFG
+    _WORKER_CFG = cfg
+    torch.set_num_threads(1)
+    RDLogger.DisableLog("rdApp.*")
+
+
+def _process_row(task: dict) -> dict:
+    cfg = _WORKER_CFG if _WORKER_CFG is not None else GraphConfig(**task["cfg"])
+    graph_path = Path(task["graph_path"])
+    if graph_path.is_file() and not task["overwrite"]:
+        return {"ok": True, "id": task["id"], "graph_path": str(graph_path), "affinity": task["affinity"], "split": task["split"], "ligand_used": "cached"}
+    builder = ComplexPreprocessor(cfg)
+    try:
+        graph, used = builder.build_with_fallback(task["structure_path"], task["ligand_candidates"], task["affinity"], task["id"])
+        torch.save(graph, graph_path)
+        return {"ok": True, "id": task["id"], "graph_path": str(graph_path), "affinity": task["affinity"], "split": task["split"], "ligand_used": str(used)}
+    except Exception as exc:
+        return {"ok": False, "id": task["id"], "reason": str(exc)[:500]}
+
+
+def preprocess_manifest(manifest: str | Path, out_dir: str | Path, cfg: GraphConfig, workers: int | None = None, overwrite: bool = False, prefer_pocket: bool = True) -> Path:
     manifest = Path(manifest).resolve()
     out_dir = Path(out_dir).resolve()
     graph_dir = out_dir / "graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(manifest)
-    required = {"id", "protein_path", "ligand_path", "affinity"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Manifest missing columns: {sorted(missing)}")
-    if "split" not in df.columns:
-        df["split"] = "train"
+    df = _read_manifest(manifest)
 
-    builder = ComplexPreprocessor(cfg)
-    rows = []
-    for row in tqdm(df.to_dict("records"), desc="preprocess"):
-        protein_path = Path(row["protein_path"])
-        ligand_path = Path(row["ligand_path"])
-        if not protein_path.is_absolute():
-            protein_path = (manifest.parent / protein_path).resolve()
-        if not ligand_path.is_absolute():
-            ligand_path = (manifest.parent / ligand_path).resolve()
-        key = hashlib.sha1(f"{row['id']}|{protein_path}|{ligand_path}".encode()).hexdigest()[:12]
-        graph_path = graph_dir / f"{row['id']}_{key}.pt"
-        try:
-            graph = builder.build(protein_path, ligand_path, float(row["affinity"]), str(row["id"]))
-            torch.save(graph, graph_path)
-            rows.append({"id": row["id"], "graph_path": str(graph_path), "affinity": float(row["affinity"]), "split": row["split"]})
-        except Exception as exc:
-            print(f"[skip] {row['id']}: {exc}")
+    tasks = []
+    for row in df.to_dict("records"):
+        protein_path = _resolve(row["protein_path"], manifest.parent)
+        pocket_path = _resolve(row.get("pocket_path"), manifest.parent) if prefer_pocket else None
+        structure_path = pocket_path if pocket_path is not None and pocket_path.is_file() else protein_path
+        ligand_candidates = [p for p in (_resolve(row["ligand_path"], manifest.parent), _resolve(row.get("ligand_alt_path"), manifest.parent)) if p is not None]
+        key = hashlib.sha1(f"{row['id']}|{structure_path}|{ligand_candidates[0]}".encode()).hexdigest()[:12]
+        tasks.append({
+            "id": str(row["id"]), "affinity": float(row["affinity"]), "split": str(row["split"]),
+            "structure_path": str(structure_path), "ligand_candidates": [str(p) for p in ligand_candidates],
+            "graph_path": str(graph_dir / f"{row['id']}_{key}.pt"), "overwrite": overwrite, "cfg": asdict(cfg),
+        })
 
+    workers = workers if workers is not None else max(1, (os.cpu_count() or 2) - 1)
+    t0 = time.time()
+    rows, skipped = [], []
+    if workers <= 1:
+        _worker_init(cfg)
+        results = (_process_row(t) for t in tasks)
+        for res in tqdm(results, total=len(tasks), desc="preprocess"):
+            (rows if res["ok"] else skipped).append(res)
+    else:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(workers, initializer=_worker_init, initargs=(cfg,)) as pool:
+            for res in tqdm(pool.imap_unordered(_process_row, tasks, chunksize=4), total=len(tasks), desc="preprocess"):
+                (rows if res["ok"] else skipped).append(res)
+
+    order = {t["id"]: i for i, t in enumerate(tasks)}
+    rows.sort(key=lambda r: order[r["id"]])
+    skipped.sort(key=lambda r: order[r["id"]])
     processed_manifest = out_dir / "processed_manifest.csv"
-    pd.DataFrame(rows).to_csv(processed_manifest, index=False)
+    pd.DataFrame(rows, columns=["id", "graph_path", "affinity", "split", "ligand_used"]).to_csv(processed_manifest, index=False)
+    pd.DataFrame(skipped, columns=["id", "reason"]).to_csv(out_dir / "skipped.csv", index=False)
+
+    from bapred2 import __version__
+
+    meta = {
+        "bapred2_version": __version__,
+        "graph": asdict(cfg),
+        "source_manifest": str(manifest),
+        "prefer_pocket": prefer_pocket,
+        "n_input": len(tasks),
+        "n_processed": len(rows),
+        "n_skipped": len(skipped),
+        "split_counts": {k: int(v) for k, v in pd.Series([r["split"] for r in rows]).value_counts().sort_index().items()},
+        "elapsed_sec": round(time.time() - t0, 1),
+        "torch": str(torch.__version__),
+        "rdkit": Chem.rdBase.rdkitVersion,
+    }
+    (out_dir / "preprocess_config.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
+    print(f"processed {len(rows)} / {len(tasks)} complexes ({len(skipped)} skipped) in {meta['elapsed_sec']}s -> {processed_manifest}")
     return processed_manifest
 
 
@@ -175,9 +270,12 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--config", default=None)
+    parser.add_argument("--workers", type=int, default=None, help="process count (default: cpu_count - 1)")
+    parser.add_argument("--overwrite", action="store_true", help="rebuild graphs that already exist in --out")
+    parser.add_argument("--no-pocket", action="store_true", help="ignore the pocket_path column and always parse protein_path")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    print(preprocess_manifest(args.manifest, args.out, cfg.graph))
+    preprocess_manifest(args.manifest, args.out, cfg.graph, workers=args.workers, overwrite=args.overwrite, prefer_pocket=not args.no_pocket)
 
 
 if __name__ == "__main__":
