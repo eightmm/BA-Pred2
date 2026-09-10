@@ -36,29 +36,48 @@ id,protein_path,ligand_path,affinity,split
 
 `affinity` should be a pKd/pKi-like `-log10(M)` target.
 
+Optional columns: `pocket_path` (a pre-cut pocket PDB, parsed instead of `protein_path` when present), `ligand_alt_path`
+(tried when `ligand_path` fails to parse), and any metadata. `pKd` is accepted as an alias of `affinity`.
+
 ### Build a PDBbind manifest
 
 ```bash
 python scripts/make_pdbbind_manifest.py \
-  --root /data/PDBbind \
-  --index /data/PDBbind/index/INDEX_general_PL_data.2020 \
-  --out data/pdbbind.csv
+  --root /data/PDBbind/general-set \
+  --index /data/PDBbind/INDEX_general_PL_data.2020 \
+  --out data/pdbbind_v2020_casf2016.csv \
+  --split-mode casf2016 \
+  --core-set /data/CASF-2016/power_screening/CoreSet.dat \
+  --refined-dir /data/PDBbind/refined-set
 ```
 
-The helper uses column 4 of a standard PDBbind index as the target. The default split is random; replace it with the exact split required by your benchmark before reporting results.
+`--root` must point at one set directory (`general-set` contains every indexed complex; `refined-set` and
+`v2020-other-PL` are overlapping copies). `--split-mode casf2016` puts the CASF-2016 core set in `test` and draws
+`val` (`--val-frac`, default 0.1) from the remainder; `--split-mode random` is the smoke-test default. The manifest also
+carries release year, resolution, Kd/Ki/IC50 type and relation (`=`, `<`, `>`, `~`) so temporal or censored-label
+filtering can be applied later without re-parsing the index.
+
+## Environment
+
+Python >= 3.12, torch >= 2.14 (the PyPI wheel ships CUDA 13 and supports Blackwell / sm_120), PyG >= 2.8, RDKit >= 2026.3.
+
+```bash
+uv sync            # creates .venv with the dev group (pytest, ruff)
+uv run pytest -q
+```
 
 ## Preprocess
 
 ```bash
-pip install -e .
-
 bapred2-preprocess \
-  --manifest data/pdbbind.csv \
-  --out data/processed \
-  --config configs/bapred2_base.yaml
+  --manifest data/pdbbind_v2020_casf2016.csv \
+  --out data/processed/pdbbind_v2020_casf2016 \
+  --config configs/bapred2_base.yaml \
+  --workers 19
 ```
 
-Output: cached PyG graphs plus `data/processed/processed_manifest.csv`.
+Output: cached PyG graphs, `processed_manifest.csv`, `skipped.csv` (complex id + reason) and `preprocess_config.yaml`
+(graph settings, versions, counts). Existing graphs are reused unless `--overwrite` is given.
 
 ## Train
 
@@ -70,7 +89,11 @@ bapred2-train \
   --device cuda
 ```
 
-Training samples recurrent depth from `[2, 3, 4, 6, 8]`. The default objective is Huber loss and the best checkpoint is selected by validation RMSE.
+Training samples recurrent depth from `[2, 3, 4, 6, 8]`. The default objective is Huber loss and the best checkpoint is
+selected by validation RMSE. Mixed precision defaults to bfloat16 (`train.amp_dtype`). `history.json` records parameter
+count, mean training recycles, epoch wall time and peak GPU memory. For a quick end-to-end check use
+`--epochs 2 --limit-train 2000 --limit-val 300`. Checkpoints store the config and feature dims, so evaluation does not
+need a matching manifest sample.
 
 ## Test-time recycle sweep
 
@@ -79,10 +102,11 @@ bapred2-eval \
   --manifest data/processed/processed_manifest.csv \
   --checkpoint runs/base/best.pt \
   --split test \
-  --recycles 1,2,3,4,6,8,12
+  --recycles 1,2,3,4,6,8,12,16 \
+  --out runs/base/recycle_sweep.json
 ```
 
-The evaluator reports RMSE, MAE, Pearson, Spearman and the hidden-state update magnitude at each cycle. The important architectural test is whether performance remains stable or improves when inference recurrence is increased at fixed parameter count.
+The evaluator reports RMSE, MAE, Pearson, Spearman, wall time and the hidden-state update magnitude at each cycle. The important architectural test is whether performance remains stable or improves when inference recurrence is increased at fixed parameter count.
 
 ## First ablations
 
@@ -97,4 +121,6 @@ The current implementation uses contacts sharing a protein or ligand atom as a b
 
 ## Status
 
-Training and preprocessing code are implemented. Scientific validation still requires preprocessing the target dataset and running the benchmark experiments.
+Milestone 0 (runnable scalar baseline) is implemented and exercised end-to-end on PDBbind v2020 with the CASF-2016
+core set as test split. The SPEC-by-SPEC audit, including what is partial or missing for later milestones, is in
+[docs/GAPS.md](docs/GAPS.md); the architecture critique with probe evidence is in [docs/ARCHITECTURE_REVIEW.md](docs/ARCHITECTURE_REVIEW.md). Run reports are rendered with `python scripts/make_report.py --run runs/<name> --out report.html`.
