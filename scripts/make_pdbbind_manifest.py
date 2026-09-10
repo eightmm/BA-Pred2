@@ -22,7 +22,7 @@ AFFINITY_RE = re.compile(r"^(Kd|Ki|IC50)([=<>~]+)(.+)$")
 def parse_index(path: Path) -> dict[str, dict]:
     """Columns of INDEX_general_PL_data: code, resolution, release year, -logKd/Ki, Kd/Ki string, // ref (ligand)."""
     records = {}
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
@@ -59,7 +59,7 @@ def parse_index(path: Path) -> dict[str, dict]:
 
 def parse_id_list(path: Path) -> set[str]:
     ids = set()
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):

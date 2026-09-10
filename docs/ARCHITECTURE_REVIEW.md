@@ -8,6 +8,10 @@ Assessment of the BA-Pred2 model as implemented in `src/bapred2/model/{model,lay
 
 Probe evidence is from an under-trained checkpoint; the *mechanisms* it exposes are structural.
 
+**Status (v0.2):** items 1, 2, 3, 4, 6 and the LayerScale bound below are implemented behind config flags
+(`configs/bapred2_v0.2a.yaml` data only, `configs/bapred2_v0.2b.yaml` data + model); item 5 (triangle context) is
+not. Defaults reproduce Milestone 0, so `runs/base` checkpoints still load.
+
 ## What is done well
 
 1. **Static/dynamic separation is real, not nominal.** `h^0`, `q^0`, `z` are computed once and enter every

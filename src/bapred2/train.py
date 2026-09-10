@@ -61,7 +61,7 @@ def count_parameters(model: torch.nn.Module) -> int:
 
 def run_eval(model, loader, device, recycles: int, return_predictions: bool = False):
     model.eval()
-    ids, ys, ps, cycle_deltas = [], [], [], []
+    ids, ys, ps, cycle_deltas, state_stats = [], [], [], [], {}
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -73,9 +73,12 @@ def run_eval(model, loader, device, recycles: int, return_predictions: bool = Fa
                 ids.extend(list(batch.sample_id))
             if aux["cycle_delta"].numel():
                 cycle_deltas.append(aux["cycle_delta"].cpu())
+                for k, v in aux.get("state_stats", {}).items():
+                    state_stats.setdefault(k, []).append(v.cpu())
     out = metrics(ys, ps)
     if cycle_deltas:
         out["cycle_delta"] = torch.stack(cycle_deltas).mean(0).tolist()
+        out["state_stats"] = {k: torch.stack(v).mean(0).tolist() for k, v in state_stats.items()}
     if return_predictions:
         out["predictions"] = [{"id": i, "y": y, "pred": p} for i, y, p in zip(ids, ys, ps)]
     return out
@@ -141,10 +144,18 @@ def main():
             batch = batch.to(device)
             recycles = sample_recycles(cfg.model.train_recycles, cfg.model.train_recycle_probs)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                pred = model(batch, recycles=recycles)
             target = batch.y.reshape(-1)
-            loss = loss_fn(pred.float(), target, cfg.train.loss, cfg.train.huber_delta)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                if cfg.train.cycle_loss_weight > 0:
+                    preds = model(batch, recycles=recycles, return_all_cycles=True).float()  # [T, B]
+                    loss = loss_fn(preds[-1], target, cfg.train.loss, cfg.train.huber_delta)
+                    if preds.size(0) > 1:
+                        weights = torch.arange(1, preds.size(0), device=device, dtype=torch.float32) / preds.size(0)
+                        early = torch.stack([loss_fn(preds[t], target, cfg.train.loss, cfg.train.huber_delta) for t in range(preds.size(0) - 1)])
+                        loss = loss + cfg.train.cycle_loss_weight * (weights * early).sum() / weights.sum()
+                else:
+                    pred = model(batch, recycles=recycles)
+                    loss = loss_fn(pred.float(), target, cfg.train.loss, cfg.train.huber_delta)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)

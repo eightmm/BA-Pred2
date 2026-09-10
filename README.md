@@ -79,6 +79,18 @@ bapred2-preprocess \
 Output: cached PyG graphs, `processed_manifest.csv`, `skipped.csv` (complex id + reason) and `preprocess_config.yaml`
 (graph settings, versions, counts). Existing graphs are reused unless `--overwrite` is given.
 
+The `graph:` section decides what a cache contains. `configs/bapred2_base.yaml` reproduces the Milestone-0 cache;
+`configs/bapred2_v0.2a.yaml` adds residue/atom-name tokens (`protein.token_res`, `protein.token_atom`), residue-template
+chemistry flags on nodes and interface edges, and drops crystal waters, so it needs its own `--out` directory.
+
+## Configs
+
+| config | data | model |
+|---|---|---|
+| `bapred2_base.yaml` | RDKit-only protein chemistry, waters kept | Milestone-0 scalar recurrent block |
+| `bapred2_v0.2a.yaml` | + residue/atom tokens, template flags, no waters | same as base (isolates the data effect) |
+| `bapred2_v0.2b.yaml` | same as v0.2a | + interpolating node updates, bounded LayerScale, pre-readout LN, block readout norm, core dropout 0.05 |
+
 ## Train
 
 ```bash

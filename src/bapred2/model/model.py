@@ -5,11 +5,21 @@ from torch import nn
 from torch_geometric.nn import global_add_pool
 from torch_geometric.utils import scatter
 
+from bapred2.data.features import N_ATOM_TOKENS, N_RES_TOKENS
+
 from .layers import IntraPropagation, RecurrentBindingBlock
 
 P_REL = ("protein", "intra", "protein")
 L_REL = ("ligand", "intra", "ligand")
 C_REL = ("protein", "contact", "ligand")
+
+
+def _mean_pairwise_cosine(h: torch.Tensor, max_nodes: int = 2048) -> torch.Tensor:
+    """Oversmoothing probe: mean cosine between centred node states (subsampled for large batches)."""
+    if h.size(0) > max_nodes:
+        h = h[torch.randperm(h.size(0), device=h.device)[:max_nodes]]
+    z = torch.nn.functional.normalize(h - h.mean(0, keepdim=True), dim=-1)
+    return (z @ z.t()).mean()
 
 
 class BAPred2(nn.Module):
@@ -26,9 +36,19 @@ class BAPred2(nn.Module):
         dropout: float = 0.1,
         layerscale_init: float = 0.1,
         use_endpoint_context: bool = True,
+        protein_tokens: bool = False,
+        node_update: str = "residual",
+        bounded_scale: bool = False,
+        pre_readout_norm: bool = False,
+        readout_norm: str = "concat",
+        core_dropout: float | None = None,
     ):
         super().__init__()
         d = hidden_dim
+        self.protein_tokens = protein_tokens
+        self.pre_readout_norm = pre_readout_norm
+        self.readout_norm = readout_norm
+        core_dropout = dropout if core_dropout is None else core_dropout
         self.p_node = nn.Linear(protein_node_dim, d)
         self.l_node = nn.Linear(ligand_node_dim, d)
         self.p_pos = nn.Linear(pos_dim, d)
@@ -39,12 +59,25 @@ class BAPred2(nn.Module):
         self.p_init_norm = nn.LayerNorm(d)
         self.l_init_norm = nn.LayerNorm(d)
         self.q_init_norm = nn.LayerNorm(d)
-        self.p_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init) for _ in range(prelude_layers)])
-        self.l_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init) for _ in range(prelude_layers)])
-        self.core = RecurrentBindingBlock(d, dropout, layerscale_init, use_endpoint_context)
+        if protein_tokens:
+            # nn.Embedding == one-hot x Linear(bias=False); ints in the graph instead of 198 one-hot floats per atom.
+            self.res_embed = nn.Embedding(N_RES_TOKENS, d)
+            self.atom_embed = nn.Embedding(N_ATOM_TOKENS, d)
+        self.p_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init, node_update, bounded_scale) for _ in range(prelude_layers)])
+        self.l_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init, node_update, bounded_scale) for _ in range(prelude_layers)])
+        self.core = RecurrentBindingBlock(d, core_dropout, layerscale_init, use_endpoint_context, node_update, bounded_scale)
+        if pre_readout_norm:
+            self.p_out_norm, self.l_out_norm, self.q_out_norm = nn.LayerNorm(d), nn.LayerNorm(d), nn.LayerNorm(d)
         self.interface_weight = nn.Linear(d, 1)
+        if readout_norm == "block":
+            self.block_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(4)])
+            first = nn.Identity()
+        elif readout_norm == "concat":
+            first = nn.LayerNorm(d * 4)
+        else:
+            raise ValueError(f"unknown readout_norm {readout_norm!r}")
         self.readout = nn.Sequential(
-            nn.LayerNorm(d * 4),
+            first,
             nn.Linear(d * 4, d * 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -53,30 +86,24 @@ class BAPred2(nn.Module):
             nn.Linear(d, 1),
         )
 
-    def forward(self, data, recycles: int = 6, return_aux: bool = False):
-        hp0 = self.p_init_norm(self.p_node(data["protein"].x) + self.p_pos(data["protein"].pos_enc))
+    def _encode(self, data):
+        hp0 = self.p_node(data["protein"].x) + self.p_pos(data["protein"].pos_enc)
+        if self.protein_tokens:
+            hp0 = hp0 + self.res_embed(data["protein"].token_res) + self.atom_embed(data["protein"].token_atom)
+        hp0 = self.p_init_norm(hp0)
         hl0 = self.l_init_norm(self.l_node(data["ligand"].x) + self.l_pos(data["ligand"].pos_enc))
         pe = self.p_edge(data[P_REL].edge_attr)
         le = self.l_edge(data[L_REL].edge_attr)
         q0 = self.q_init_norm(self.q_edge(data[C_REL].edge_attr))
-        hp, hl, q = hp0, hl0, q0
-        for pblock, lblock in zip(self.p_prelude, self.l_prelude):
-            hp = pblock(hp, hp0, data[P_REL].edge_index, pe)
-            hl = lblock(hl, hl0, data[L_REL].edge_index, le)
-        deltas = []
-        for _ in range(int(recycles)):
-            old_hp, old_hl, old_q = hp, hl, q
-            hp, hl, q = self.core(
-                hp, hl, hp0, hl0, q, q0, data[C_REL].edge_index,
-                data[P_REL].edge_index, pe, data[L_REL].edge_index, le,
-            )
-            if return_aux:
-                delta = ((hp-old_hp).pow(2).mean().sqrt() + (hl-old_hl).pow(2).mean().sqrt() + (q-old_q).pow(2).mean().sqrt()) / 3.0
-                deltas.append(delta.detach())
+        return hp0, hl0, pe, le, q0
+
+    def _readout(self, hp, hl, q, data):
         pidx, lidx = data[C_REL].edge_index
         p_batch = data["protein"].batch
         l_batch = data["ligand"].batch
         batch_size = int(max(p_batch.max().item(), l_batch.max().item())) + 1
+        if self.pre_readout_norm:
+            hp, hl, q = self.p_out_norm(hp), self.l_out_norm(hl), self.q_out_norm(q)
         edge_batch = l_batch[lidx]
         w = torch.sigmoid(self.interface_weight(q))
         q_pool = scatter(w * q, edge_batch, dim=0, dim_size=batch_size, reduce="sum")
@@ -85,9 +112,40 @@ class BAPred2(nn.Module):
         l_strength = scatter(w, lidx, dim=0, dim_size=hl.size(0), reduce="sum")
         p_contact = global_add_pool(p_strength * hp, p_batch, size=batch_size)
         l_contact = global_add_pool(l_strength * hl, l_batch, size=batch_size)
-        pred = self.readout(torch.cat([l_pool, q_pool, p_contact, l_contact], dim=-1)).squeeze(-1)
+        blocks = [l_pool, q_pool, p_contact, l_contact]
+        if self.readout_norm == "block":
+            blocks = [n(b) for n, b in zip(self.block_norms, blocks)]
+        return self.readout(torch.cat(blocks, dim=-1)).squeeze(-1)
+
+    def forward(self, data, recycles: int = 6, return_aux: bool = False, return_all_cycles: bool = False):
+        """Returns pred [B]; with ``return_all_cycles`` the per-cycle predictions [T, B] instead; ``return_aux`` adds
+        ``cycle_delta`` [T] (mean RMS state change) and ``state_stats`` (per-state norms/deltas/cosine per cycle)."""
+        hp0, hl0, pe, le, q0 = self._encode(data)
+        hp, hl, q = hp0, hl0, q0
+        for pblock, lblock in zip(self.p_prelude, self.l_prelude):
+            hp = pblock(hp, hp0, data[P_REL].edge_index, pe)
+            hl = lblock(hl, hl0, data[L_REL].edge_index, le)
+        deltas, stats, cycle_preds = [], {k: [] for k in ("delta_p", "delta_l", "delta_q", "norm_p", "norm_l", "norm_q", "cos_p", "cos_l")}, []
+        for _ in range(int(recycles)):
+            old_hp, old_hl, old_q = hp, hl, q
+            hp, hl, q = self.core(
+                hp, hl, hp0, hl0, q, q0, data[C_REL].edge_index,
+                data[P_REL].edge_index, pe, data[L_REL].edge_index, le,
+            )
+            if return_aux:
+                with torch.no_grad():
+                    dp, dl, dq = (hp - old_hp).pow(2).mean().sqrt(), (hl - old_hl).pow(2).mean().sqrt(), (q - old_q).pow(2).mean().sqrt()
+                    deltas.append((dp + dl + dq) / 3.0)
+                    for k, v in (("delta_p", dp), ("delta_l", dl), ("delta_q", dq), ("norm_p", hp.norm(dim=-1).mean()), ("norm_l", hl.norm(dim=-1).mean()),
+                                 ("norm_q", q.norm(dim=-1).mean()), ("cos_p", _mean_pairwise_cosine(hp)), ("cos_l", _mean_pairwise_cosine(hl))):
+                        stats[k].append(v.float())
+            if return_all_cycles:
+                cycle_preds.append(self._readout(hp, hl, q, data))
+        pred = torch.stack(cycle_preds, dim=0) if return_all_cycles else self._readout(hp, hl, q, data)
         if return_aux:
-            return pred, {"cycle_delta": torch.stack(deltas) if deltas else torch.empty(0, device=pred.device)}
+            aux = {"cycle_delta": torch.stack(deltas) if deltas else torch.empty(0, device=pred.device)}
+            aux["state_stats"] = {k: torch.stack(v) if v else torch.empty(0, device=pred.device) for k, v in stats.items()}
+            return pred, aux
         return pred
 
 
@@ -111,10 +169,18 @@ def model_from_dims(dims: dict[str, int], cfg) -> BAPred2:
         dropout=cfg.dropout,
         layerscale_init=cfg.layerscale_init,
         use_endpoint_context=cfg.use_endpoint_context,
+        protein_tokens=cfg.protein_tokens,
+        node_update=cfg.node_update,
+        bounded_scale=cfg.bounded_scale,
+        pre_readout_norm=cfg.pre_readout_norm,
+        readout_norm=cfg.readout_norm,
+        core_dropout=cfg.core_dropout,
     )
 
 
 def model_from_sample(sample, cfg) -> BAPred2:
+    if cfg.protein_tokens and not hasattr(sample["protein"], "token_res"):
+        raise ValueError("model.protein_tokens=true but the graphs carry no protein.token_res; preprocess with graph.protein_tokens=true")
     return model_from_dims(feature_dims_from_sample(sample), cfg)
 
 

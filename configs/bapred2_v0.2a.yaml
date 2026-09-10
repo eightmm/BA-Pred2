@@ -1,3 +1,5 @@
+# v0.2a = Milestone-0 model on the v0.2 data (residue/atom tokens, template chemistry flags, no crystal waters).
+# Only the data changes relative to configs/bapred2_base.yaml, so base vs v0.2a isolates the feature effect.
 graph:
   pocket_cutoff: 8.0
   interface_cutoff: 5.0
@@ -6,10 +8,9 @@ graph:
   max_spatial_neighbors: 32
   distance_rbf_dim: 16
   rwpe_dim: 20
-  # Milestone-0 cache: no residue tokens, no chemistry flags on nodes, crystal waters kept
-  protein_tokens: false
-  node_chem_flags: false
-  drop_water: false
+  protein_tokens: true
+  node_chem_flags: true
+  drop_water: true
 
 model:
   hidden_dim: 256
@@ -20,6 +21,11 @@ model:
   train_recycles: [2, 3, 4, 6, 8]
   train_recycle_probs: [0.25, 0.25, 0.20, 0.20, 0.10]
   eval_recycles: 6
+  protein_tokens: true
+  node_update: residual
+  bounded_scale: false
+  pre_readout_norm: false
+  readout_norm: concat
 
 train:
   seed: 42
@@ -32,4 +38,6 @@ train:
   loss: huber
   huber_delta: 1.0
   amp: true
+  amp_dtype: bfloat16
   early_stop_patience: 20
+  cycle_loss_weight: 0.0

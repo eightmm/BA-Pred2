@@ -16,7 +16,19 @@ from torch_geometric.data import HeteroData
 from tqdm import tqdm
 
 from bapred2.config import GraphConfig, load_config
-from .features import add_spatial_edges, atom_property_masks, bonded_edges, coords_tensor, local_direction, node_feature_tensor, random_walk_pe, rbf_distance
+
+from .features import (
+    add_spatial_edges,
+    atom_property_masks,
+    bonded_edges,
+    coords_tensor,
+    is_water_atom,
+    local_direction,
+    node_feature_tensor,
+    protein_tokens_and_flags,
+    random_walk_pe,
+    rbf_distance,
+)
 
 # Manifest contract (SPEC 14.1). ``pKd`` is accepted as an alias of ``affinity``; ``pocket_path`` and
 # ``ligand_alt_path`` are optional accelerators/fallbacks produced by scripts/make_pdbbind_manifest.py.
@@ -67,8 +79,10 @@ def _residue_key(atom: Chem.Atom):
     return (info.GetChainId(), info.GetResidueNumber(), info.GetInsertionCode(), info.GetResidueName())
 
 
-def _select_pocket(protein: Chem.Mol, ligand: Chem.Mol, cutoff: float) -> list[int]:
+def _select_pocket(protein: Chem.Mol, ligand: Chem.Mol, cutoff: float, drop_water: bool = False) -> list[int]:
     p_heavy = _heavy_indices(protein)
+    if drop_water:
+        p_heavy = [i for i in p_heavy if not is_water_atom(protein.GetAtomWithIdx(i))]
     l_heavy = _heavy_indices(ligand)
     pcoord = coords_tensor(protein, p_heavy)
     lcoord = coords_tensor(ligand, l_heavy)
@@ -104,7 +118,7 @@ class ComplexPreprocessor:
     def build(self, protein_path: str | Path, ligand_path: str | Path, affinity: float, sample_id: str) -> HeteroData:
         protein = _load_protein(protein_path)
         ligand = _load_ligand(ligand_path)
-        p_sel = _select_pocket(protein, ligand, self.cfg.pocket_cutoff)
+        p_sel = _select_pocket(protein, ligand, self.cfg.pocket_cutoff, self.cfg.drop_water)
         l_sel = _heavy_indices(ligand)
         if not p_sel or not l_sel:
             raise ValueError("Empty protein pocket or ligand")
@@ -117,8 +131,16 @@ class ComplexPreprocessor:
             raise ValueError("No protein-ligand interface edges inside cutoff")
         d = dist[p_idx, l_idx]
 
-        p_mask = atom_property_masks(protein, p_sel)
+        tokens = None
+        if self.cfg.protein_tokens:
+            token_res, token_atom, p_mask = protein_tokens_and_flags(protein, p_sel)
+            tokens = (token_res, token_atom)
+        else:
+            p_mask = atom_property_masks(protein, p_sel)
         l_mask = atom_property_masks(ligand, l_sel)
+        if self.cfg.node_chem_flags:
+            px = torch.cat([px, p_mask], dim=-1)
+            lx = torch.cat([lx, l_mask], dim=-1)
         cross_vec = lpos[l_idx] - ppos[p_idx]
         cross_unit = cross_vec / cross_vec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         cos_p = (pdir[p_idx] * cross_unit).sum(-1, keepdim=True)
@@ -132,6 +154,8 @@ class ComplexPreprocessor:
 
         data = HeteroData()
         data["protein"].x, data["protein"].pos, data["protein"].pos_enc = px, ppos, ppe
+        if tokens is not None:
+            data["protein"].token_res, data["protein"].token_atom = tokens
         data["ligand"].x, data["ligand"].pos, data["ligand"].pos_enc = lx, lpos, lpe
         data[("protein", "intra", "protein")].edge_index = pei
         data[("protein", "intra", "protein")].edge_attr = pea

@@ -1,3 +1,5 @@
+# v0.2b = v0.2a data + recurrent-stability changes (SPEC 3.3/10/11): interpolating node updates, bounded LayerScale,
+# LayerNorm before pooling, per-block readout norm, lower dropout inside the shared core. Same optimiser as base.
 graph:
   pocket_cutoff: 8.0
   interface_cutoff: 5.0
@@ -6,10 +8,9 @@ graph:
   max_spatial_neighbors: 32
   distance_rbf_dim: 16
   rwpe_dim: 20
-  # Milestone-0 cache: no residue tokens, no chemistry flags on nodes, crystal waters kept
-  protein_tokens: false
-  node_chem_flags: false
-  drop_water: false
+  protein_tokens: true
+  node_chem_flags: true
+  drop_water: true
 
 model:
   hidden_dim: 256
@@ -20,6 +21,12 @@ model:
   train_recycles: [2, 3, 4, 6, 8]
   train_recycle_probs: [0.25, 0.25, 0.20, 0.20, 0.10]
   eval_recycles: 6
+  protein_tokens: true
+  node_update: interpolate
+  bounded_scale: true
+  pre_readout_norm: true
+  readout_norm: block
+  core_dropout: 0.05
 
 train:
   seed: 42
@@ -32,4 +39,6 @@ train:
   loss: huber
   huber_delta: 1.0
   amp: true
+  amp_dtype: bfloat16
   early_stop_patience: 20
+  cycle_loss_weight: 0.0

@@ -26,18 +26,18 @@ def build_complex(rotation=None, translation=None):
     peptide = _embed(Chem.MolFromSequence("GAV"), seed=7)
     ligand = _embed(Chem.MolFromSmiles("c1ccccc1O"), seed=11)
     p = _coords(peptide)
-    l = _coords(ligand)
-    l = l - l.mean(0)
-    l[:, 0] += p[:, 0].max() - l[:, 0].min() + 3.0
-    l[:, 1:] += p[:, 1:].mean(0)
+    lig = _coords(ligand)
+    lig = lig - lig.mean(0)
+    lig[:, 0] += p[:, 0].max() - lig[:, 0].min() + 3.0
+    lig[:, 1:] += p[:, 1:].mean(0)
     if rotation is not None:
         p = p @ rotation.T
-        l = l @ rotation.T
+        lig = lig @ rotation.T
     if translation is not None:
         p = p + translation
-        l = l + translation
+        lig = lig + translation
     _set_coords(peptide, p)
-    _set_coords(ligand, l)
+    _set_coords(ligand, lig)
     return peptide, ligand
 
 

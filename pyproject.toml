@@ -40,3 +40,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+# Pinned so CI does not drift with ruff's expanding default rule set.
+select = ["E4", "E7", "E9", "F", "UP", "I"]
