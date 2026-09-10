@@ -10,7 +10,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install -e . pytest
+          python-version: "3.12"
+      # CPU wheel first so the PyPI default (CUDA 13 + nvidia-* libs) is not pulled into CI.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e . pytest ruff
+      - run: ruff check src scripts tests
       - run: pytest -q
       - run: python -m compileall -q src scripts

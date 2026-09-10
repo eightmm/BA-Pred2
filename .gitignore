@@ -12,3 +12,5 @@ data/processed/
 *.pt
 *.pth
 *.ckpt
+# manifests embed machine-local absolute paths; regenerate with scripts/make_pdbbind_manifest.py
+/data/

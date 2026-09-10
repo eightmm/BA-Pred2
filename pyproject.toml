@@ -7,17 +7,17 @@ name = "bapred2"
 version = "0.1.0"
 description = "Recurrent graph inference for protein-ligand binding affinity prediction"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Jaemin Sim" }]
 dependencies = [
-  "torch>=2.7.0",
+  "torch>=2.14.0",
   "torch-geometric>=2.8.0",
-  "rdkit>=2025.9.0",
-  "numpy>=1.26",
-  "pandas>=2.0",
-  "scipy>=1.11",
-  "pyyaml>=6.0",
+  "rdkit>=2026.3.6",
+  "numpy>=2.3",
+  "pandas>=3.0",
+  "scipy>=1.18",
+  "pyyaml>=6.0.3",
   "tqdm>=4.67",
 ]
 
@@ -33,7 +33,10 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.9"]
+dev = ["pytest>=9.1", "ruff>=0.16"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
