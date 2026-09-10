@@ -38,7 +38,10 @@ def test_template_tokens_and_flags(tmp_path):
     for k, i in enumerate(idx):
         info = prot.GetAtomWithIdx(i).GetPDBResidueInfo()
         by_name[(info.GetResidueName().strip(), info.GetName().strip())] = k
-    f = lambda res, name, flag: float(flags[by_name[(res, name)], FLAG[flag]])
+
+    def f(res, name, flag):
+        return float(flags[by_name[(res, name)], FLAG[flag]])
+
     assert f("LYS", "NZ", "cation") == 1 and f("LYS", "NZ", "hbd") == 1
     assert f("ASP", "OD1", "anion") == 1 and f("ASP", "OD2", "hba") == 1
     assert f("SER", "OG", "hbd") == 1 and f("SER", "OG", "hba") == 1
