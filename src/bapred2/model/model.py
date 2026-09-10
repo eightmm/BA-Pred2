@@ -7,6 +7,10 @@ from torch_geometric.utils import scatter
 
 from .layers import IntraPropagation, RecurrentBindingBlock
 
+P_REL = ("protein", "intra", "protein")
+L_REL = ("ligand", "intra", "ligand")
+C_REL = ("protein", "contact", "ligand")
+
 
 class BAPred2(nn.Module):
     def __init__(
@@ -50,29 +54,26 @@ class BAPred2(nn.Module):
         )
 
     def forward(self, data, recycles: int = 6, return_aux: bool = False):
-        p_rel = ("protein", "intra", "protein")
-        l_rel = ("ligand", "intra", "ligand")
-        c_rel = ("protein", "contact", "ligand")
         hp0 = self.p_init_norm(self.p_node(data["protein"].x) + self.p_pos(data["protein"].pos_enc))
         hl0 = self.l_init_norm(self.l_node(data["ligand"].x) + self.l_pos(data["ligand"].pos_enc))
-        pe = self.p_edge(data[p_rel].edge_attr)
-        le = self.l_edge(data[l_rel].edge_attr)
-        q0 = self.q_init_norm(self.q_edge(data[c_rel].edge_attr))
+        pe = self.p_edge(data[P_REL].edge_attr)
+        le = self.l_edge(data[L_REL].edge_attr)
+        q0 = self.q_init_norm(self.q_edge(data[C_REL].edge_attr))
         hp, hl, q = hp0, hl0, q0
         for pblock, lblock in zip(self.p_prelude, self.l_prelude):
-            hp = pblock(hp, hp0, data[p_rel].edge_index, pe)
-            hl = lblock(hl, hl0, data[l_rel].edge_index, le)
+            hp = pblock(hp, hp0, data[P_REL].edge_index, pe)
+            hl = lblock(hl, hl0, data[L_REL].edge_index, le)
         deltas = []
         for _ in range(int(recycles)):
             old_hp, old_hl, old_q = hp, hl, q
             hp, hl, q = self.core(
-                hp, hl, hp0, hl0, q, q0, data[c_rel].edge_index,
-                data[p_rel].edge_index, pe, data[l_rel].edge_index, le,
+                hp, hl, hp0, hl0, q, q0, data[C_REL].edge_index,
+                data[P_REL].edge_index, pe, data[L_REL].edge_index, le,
             )
             if return_aux:
                 delta = ((hp-old_hp).pow(2).mean().sqrt() + (hl-old_hl).pow(2).mean().sqrt() + (q-old_q).pow(2).mean().sqrt()) / 3.0
                 deltas.append(delta.detach())
-        pidx, lidx = data[c_rel].edge_index
+        pidx, lidx = data[C_REL].edge_index
         p_batch = data["protein"].batch
         l_batch = data["ligand"].batch
         batch_size = int(max(p_batch.max().item(), l_batch.max().item())) + 1
@@ -90,20 +91,43 @@ class BAPred2(nn.Module):
         return pred
 
 
-def model_from_sample(sample, cfg):
-    p_rel = ("protein", "intra", "protein")
-    l_rel = ("ligand", "intra", "ligand")
-    c_rel = ("protein", "contact", "ligand")
+def feature_dims_from_sample(sample) -> dict[str, int]:
+    """Raw feature widths the model must be built for; stored in checkpoints so eval needs no manifest sample."""
+    return {
+        "protein_node_dim": int(sample["protein"].x.size(-1)),
+        "ligand_node_dim": int(sample["ligand"].x.size(-1)),
+        "protein_edge_dim": int(sample[P_REL].edge_attr.size(-1)),
+        "ligand_edge_dim": int(sample[L_REL].edge_attr.size(-1)),
+        "interface_edge_dim": int(sample[C_REL].edge_attr.size(-1)),
+        "pos_dim": int(sample["protein"].pos_enc.size(-1)),
+    }
+
+
+def model_from_dims(dims: dict[str, int], cfg) -> BAPred2:
     return BAPred2(
-        protein_node_dim=sample["protein"].x.size(-1),
-        ligand_node_dim=sample["ligand"].x.size(-1),
-        protein_edge_dim=sample[p_rel].edge_attr.size(-1),
-        ligand_edge_dim=sample[l_rel].edge_attr.size(-1),
-        interface_edge_dim=sample[c_rel].edge_attr.size(-1),
-        pos_dim=sample["protein"].pos_enc.size(-1),
+        **dims,
         hidden_dim=cfg.hidden_dim,
         prelude_layers=cfg.prelude_layers,
         dropout=cfg.dropout,
         layerscale_init=cfg.layerscale_init,
         use_endpoint_context=cfg.use_endpoint_context,
     )
+
+
+def model_from_sample(sample, cfg) -> BAPred2:
+    return model_from_dims(feature_dims_from_sample(sample), cfg)
+
+
+def model_from_checkpoint(ckpt: dict, cfg=None) -> BAPred2:
+    """Rebuild the exact architecture from a checkpoint produced by ``bapred2-train``.
+
+    ``cfg`` (a ModelConfig) overrides the stored one only when explicitly passed; the stored feature dims are authoritative.
+    """
+    from bapred2.config import config_from_dict
+
+    if "feature_dims" not in ckpt or "config" not in ckpt:
+        raise KeyError("Checkpoint lacks 'feature_dims'/'config'; it was not written by bapred2-train >= 0.1.0")
+    model_cfg = cfg if cfg is not None else config_from_dict(ckpt["config"]).model
+    model = model_from_dims(ckpt["feature_dims"], model_cfg)
+    model.load_state_dict(ckpt["model"])
+    return model

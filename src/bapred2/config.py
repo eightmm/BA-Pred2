@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,8 @@ class TrainConfig:
     loss: str = "huber"
     huber_delta: float = 1.0
     amp: bool = True
+    # "bfloat16" needs no loss scaling and is the safe default on Ampere+/Blackwell; "float16" enables GradScaler.
+    amp_dtype: str = "bfloat16"
     early_stop_patience: int = 20
 
 
@@ -50,6 +52,9 @@ class Config:
     graph: GraphConfig = field(default_factory=GraphConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _update_dataclass(obj: Any, values: dict[str, Any]) -> Any:
@@ -64,10 +69,13 @@ def _update_dataclass(obj: Any, values: dict[str, Any]) -> Any:
     return obj
 
 
+def config_from_dict(values: dict[str, Any]) -> Config:
+    return _update_dataclass(Config(), values or {})
+
+
 def load_config(path: str | Path | None = None) -> Config:
-    cfg = Config()
     if path is None:
-        return cfg
+        return Config()
     with open(path, "r", encoding="utf-8") as f:
         values = yaml.safe_load(f) or {}
-    return _update_dataclass(cfg, values)
+    return config_from_dict(values)
