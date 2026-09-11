@@ -109,3 +109,49 @@ def test_legacy_config_dict_loads_strict():
     batch = Batch.from_data_list([sample])
     with torch.no_grad():
         assert torch.allclose(model(batch, recycles=3), rebuilt(batch, recycles=3))
+
+
+def test_cycle_trace_matches_fixed_T():
+    """Early exit at cycle t must equal a fixed run with recycles=t, otherwise adaptive stopping is not comparable."""
+    sample = make_graph()
+    torch.manual_seed(0)
+    model = model_from_sample(sample, ModelConfig(hidden_dim=32, dropout=0.0)).eval()
+    batch = Batch.from_data_list([sample, make_graph(1), make_graph(2, n_contacts=1)])
+    with torch.no_grad():
+        _, aux = model(batch, recycles=5, return_trace=True)
+        for t in range(1, 6):
+            assert torch.allclose(aux["cycle_pred"][t - 1], model(batch, recycles=t), atol=1e-5)
+    assert aux["cycle_pred"].shape == (5, 3)
+    for key in ("delta_p_graph", "delta_l_graph", "delta_q_graph"):
+        assert aux[key].shape == (5, 3) and torch.isfinite(aux[key]).all()
+    # the batch-mean of the per-graph deltas tracks the scalar diagnostic within pooling differences
+    assert aux["delta_l_graph"].mean() > 0
+
+
+def test_stop_indices_rule():
+    import numpy as np
+
+    from bapred2.evaluate import _stop_indices
+
+    signal = np.array([[9.0, 9.0, 9.0], [0.5, 9.0, 9.0], [0.1, 0.4, 9.0], [0.1, 0.1, 9.0]])
+    assert list(_stop_indices(signal, 1.0, 0)) == [1, 2, 3]  # first cycle below eps, else the last
+    assert list(_stop_indices(signal, 0.2, 0)) == [2, 3, 3]
+    assert list(_stop_indices(signal, 100.0, 1)) == [1, 1, 1]  # never stops before first_usable
+
+
+def test_q_candidate_norm_bounds_interface_state():
+    """v0.2b left ||q|| drifting upward; normalising the candidate must keep it flat across cycles."""
+    sample = make_graph()
+    base_cfg = ModelConfig(hidden_dim=32, dropout=0.0, node_update="interpolate", bounded_scale=True, pre_readout_norm=True, readout_norm="block")
+    normed_cfg = ModelConfig(hidden_dim=32, dropout=0.0, node_update="interpolate", bounded_scale=True, pre_readout_norm=True, readout_norm="block", q_candidate_norm=True)
+    batch = Batch.from_data_list([sample, make_graph(1)])
+    torch.manual_seed(0)
+    model = model_from_sample(sample, normed_cfg).eval()
+    assert model.core.q_cand_norm is not None
+    with torch.no_grad():
+        _, aux = model(batch, recycles=16, return_aux=True)
+    norms = aux["state_stats"]["norm_q"]
+    assert float(norms[-1]) < 1.5 * float(norms[0])
+    torch.manual_seed(0)
+    plain = model_from_sample(sample, base_cfg).eval()
+    assert plain.core.q_cand_norm is None

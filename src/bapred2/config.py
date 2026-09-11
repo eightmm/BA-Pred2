@@ -37,6 +37,7 @@ class ModelConfig:
     pre_readout_norm: bool = False      # LayerNorm states before pooling and interface weighting
     readout_norm: str = "concat"        # "concat": LN over the 4d concat ; "block": LN per pooled block
     core_dropout: float | None = None   # dropout inside the shared recurrent block (None -> dropout)
+    q_candidate_norm: bool = False      # LayerNorm the interface candidate so ||q|| cannot drift across cycles
     train_recycles: list[int] = field(default_factory=lambda: [2, 3, 4, 6, 8])
     train_recycle_probs: list[float] = field(default_factory=lambda: [0.25, 0.25, 0.20, 0.20, 0.10])
     eval_recycles: int = 6

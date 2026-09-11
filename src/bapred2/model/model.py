@@ -42,6 +42,7 @@ class BAPred2(nn.Module):
         pre_readout_norm: bool = False,
         readout_norm: str = "concat",
         core_dropout: float | None = None,
+        q_candidate_norm: bool = False,
     ):
         super().__init__()
         d = hidden_dim
@@ -65,7 +66,7 @@ class BAPred2(nn.Module):
             self.atom_embed = nn.Embedding(N_ATOM_TOKENS, d)
         self.p_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init, node_update, bounded_scale) for _ in range(prelude_layers)])
         self.l_prelude = nn.ModuleList([IntraPropagation(d, dropout, layerscale_init, node_update, bounded_scale) for _ in range(prelude_layers)])
-        self.core = RecurrentBindingBlock(d, core_dropout, layerscale_init, use_endpoint_context, node_update, bounded_scale)
+        self.core = RecurrentBindingBlock(d, core_dropout, layerscale_init, use_endpoint_context, node_update, bounded_scale, q_candidate_norm)
         if pre_readout_norm:
             self.p_out_norm, self.l_out_norm, self.q_out_norm = nn.LayerNorm(d), nn.LayerNorm(d), nn.LayerNorm(d)
         self.interface_weight = nn.Linear(d, 1)
@@ -117,34 +118,66 @@ class BAPred2(nn.Module):
             blocks = [n(b) for n, b in zip(self.block_norms, blocks)]
         return self.readout(torch.cat(blocks, dim=-1)).squeeze(-1)
 
-    def forward(self, data, recycles: int = 6, return_aux: bool = False, return_all_cycles: bool = False):
-        """Returns pred [B]; with ``return_all_cycles`` the per-cycle predictions [T, B] instead; ``return_aux`` adds
-        ``cycle_delta`` [T] (mean RMS state change) and ``state_stats`` (per-state norms/deltas/cosine per cycle)."""
+    @staticmethod
+    def _per_graph_rms(diff: torch.Tensor, batch: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """RMS of ``diff`` per graph, same normalisation as the global ``x.pow(2).mean().sqrt()``."""
+        sq = diff.pow(2).sum(-1)
+        total = scatter(sq, batch, dim=0, dim_size=batch_size, reduce="sum")
+        count = scatter(torch.ones_like(sq), batch, dim=0, dim_size=batch_size, reduce="sum").clamp_min(1.0)
+        return (total / (count * diff.size(-1))).sqrt()
+
+    def forward(self, data, recycles: int = 6, return_aux: bool = False, return_all_cycles: bool = False, return_trace: bool = False):
+        """Returns pred [B]; with ``return_all_cycles`` the per-cycle predictions [T, B] instead.
+
+        ``return_aux`` adds ``cycle_delta`` [T] (mean RMS state change) and ``state_stats`` (per-state norms/deltas/
+        cosine per cycle). ``return_trace`` additionally records, per cycle and per graph in the batch, the readout
+        (``cycle_pred`` [T, B]) and the state changes (``delta_{p,l,q}_graph`` [T, B]) so an evaluator can stop each
+        complex at its own convergence point; it implies ``return_aux``.
+        """
+        want_aux = return_aux or return_trace
+        need_cycle_pred = return_all_cycles or return_trace
         hp0, hl0, pe, le, q0 = self._encode(data)
         hp, hl, q = hp0, hl0, q0
         for pblock, lblock in zip(self.p_prelude, self.l_prelude):
             hp = pblock(hp, hp0, data[P_REL].edge_index, pe)
             hl = lblock(hl, hl0, data[L_REL].edge_index, le)
         deltas, stats, cycle_preds = [], {k: [] for k in ("delta_p", "delta_l", "delta_q", "norm_p", "norm_l", "norm_q", "cos_p", "cos_l")}, []
+        graph_stats = {k: [] for k in ("delta_p_graph", "delta_l_graph", "delta_q_graph")}
+        if return_trace:
+            p_batch, l_batch = data["protein"].batch, data["ligand"].batch
+            batch_size = int(max(p_batch.max().item(), l_batch.max().item())) + 1
+            q_batch = l_batch[data[C_REL].edge_index[1]]
         for _ in range(int(recycles)):
             old_hp, old_hl, old_q = hp, hl, q
             hp, hl, q = self.core(
                 hp, hl, hp0, hl0, q, q0, data[C_REL].edge_index,
                 data[P_REL].edge_index, pe, data[L_REL].edge_index, le,
             )
-            if return_aux:
+            if want_aux:
                 with torch.no_grad():
                     dp, dl, dq = (hp - old_hp).pow(2).mean().sqrt(), (hl - old_hl).pow(2).mean().sqrt(), (q - old_q).pow(2).mean().sqrt()
                     deltas.append((dp + dl + dq) / 3.0)
                     for k, v in (("delta_p", dp), ("delta_l", dl), ("delta_q", dq), ("norm_p", hp.norm(dim=-1).mean()), ("norm_l", hl.norm(dim=-1).mean()),
                                  ("norm_q", q.norm(dim=-1).mean()), ("cos_p", _mean_pairwise_cosine(hp)), ("cos_l", _mean_pairwise_cosine(hl))):
                         stats[k].append(v.float())
-            if return_all_cycles:
+            if return_trace:
+                with torch.no_grad():
+                    graph_stats["delta_p_graph"].append(self._per_graph_rms(hp - old_hp, p_batch, batch_size))
+                    graph_stats["delta_l_graph"].append(self._per_graph_rms(hl - old_hl, l_batch, batch_size))
+                    graph_stats["delta_q_graph"].append(self._per_graph_rms(q - old_q, q_batch, batch_size))
+            if need_cycle_pred:
                 cycle_preds.append(self._readout(hp, hl, q, data))
-        pred = torch.stack(cycle_preds, dim=0) if return_all_cycles else self._readout(hp, hl, q, data)
-        if return_aux:
+        if return_all_cycles:
+            pred = torch.stack(cycle_preds, dim=0)
+        else:
+            pred = cycle_preds[-1] if cycle_preds else self._readout(hp, hl, q, data)
+        if want_aux:
             aux = {"cycle_delta": torch.stack(deltas) if deltas else torch.empty(0, device=pred.device)}
             aux["state_stats"] = {k: torch.stack(v) if v else torch.empty(0, device=pred.device) for k, v in stats.items()}
+            if return_trace:
+                aux["cycle_pred"] = torch.stack(cycle_preds, dim=0) if cycle_preds else torch.empty(0, device=pred.device)
+                for k, v in graph_stats.items():
+                    aux[k] = torch.stack(v, dim=0) if v else torch.empty(0, device=pred.device)
             return pred, aux
         return pred
 
@@ -175,6 +208,7 @@ def model_from_dims(dims: dict[str, int], cfg) -> BAPred2:
         pre_readout_norm=cfg.pre_readout_norm,
         readout_norm=cfg.readout_norm,
         core_dropout=cfg.core_dropout,
+        q_candidate_norm=cfg.q_candidate_norm,
     )
 
 

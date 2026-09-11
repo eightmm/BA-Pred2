@@ -20,7 +20,7 @@ Legend: **done** = implemented and exercised by a test or a real run, **partial*
 | 7 | Equivariant vector state | missing | config block (`model.equivariant`) also absent — Milestone 4 |
 | 8 | Prelude (1 non-recurrent local layer per molecule) | done | |
 | 9.2 | Sparse interface-triangle update | missing (v0.2+) | shared-endpoint mean context exists (`use_endpoint_context`), true P-P-L / P-L-L motifs do not |
-| 10, 22 | Recurrent-state diagnostics | partial | `return_aux` now reports per-state RMS deltas, mean norms and mean pairwise cosine per cycle (`state_stats`, also in eval JSON); Dirichlet energy and norm std still missing |
+| 10, 22 | Recurrent-state diagnostics | partial | `return_aux` reports per-state RMS deltas, mean norms and mean pairwise cosine per cycle (`state_stats`); `return_trace` adds per-cycle, per-complex readouts and state deltas, which `bapred2-eval --adaptive` turns into early-exit policies. Dirichlet energy and norm std still missing |
 | 11 | Readout `[H_L_global, H_interface, H_P_contact, H_L_contact]` | done | sum pooling; v0.2b adds LN before pooling (`pre_readout_norm`) and per-block LN (`readout_norm: block`). Attention pooling not yet ablated |
 | 12 | Variable-T training, per-batch sampling | done | optional per-cycle auxiliary loss (`train.cycle_loss_weight`, off by default); probs differ from SPEC example (`[.25,.25,.20,.20,.10]` vs `[.20,.25,.25,.20,.10]`) |
 | 13 | Huber/MSE/MAE, AdamW + cosine, grad clip, AMP | done | fixed here: bf16 autocast default (`train.amp_dtype`), fp16 keeps GradScaler; loss computed in fp32 |
@@ -45,6 +45,7 @@ Legend: **done** = implemented and exercised by a test or a real run, **partial*
 - `configs/bapred2_base.yaml` - Milestone-0 reference (`runs/base`).
 - `configs/bapred2_v0.2a.yaml` - same model on the v0.2 graph cache (tokens, template flags, no waters): isolates the data effect.
 - `configs/bapred2_v0.2b.yaml` - v0.2a + interpolating node updates, bounded LayerScale, pre-readout LN, block readout norm, core dropout 0.05.
+- `configs/bapred2_v0.3.yaml` - v0.2b + per-cycle auxiliary loss (`train.cycle_loss_weight`), normalised interface candidate (`model.q_candidate_norm`), core dropout back to 0.10.
 
 ## Milestone 1+ (not started)
 

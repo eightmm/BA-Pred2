@@ -90,6 +90,7 @@ chemistry flags on nodes and interface edges, and drops crystal waters, so it ne
 | `bapred2_base.yaml` | RDKit-only protein chemistry, waters kept | Milestone-0 scalar recurrent block |
 | `bapred2_v0.2a.yaml` | + residue/atom tokens, template flags, no waters | same as base (isolates the data effect) |
 | `bapred2_v0.2b.yaml` | same as v0.2a | + interpolating node updates, bounded LayerScale, pre-readout LN, block readout norm, core dropout 0.05 |
+| `bapred2_v0.3.yaml` | same as v0.2a | + per-cycle auxiliary loss, normalised interface candidate, core dropout back to 0.10 |
 
 ## Train
 
@@ -119,6 +120,23 @@ bapred2-eval \
 ```
 
 The evaluator reports RMSE, MAE, Pearson, Spearman, wall time and the hidden-state update magnitude at each cycle. The important architectural test is whether performance remains stable or improves when inference recurrence is increased at fixed parameter count.
+
+### Per-complex early exit
+
+```bash
+bapred2-eval \
+  --manifest data/processed/pdbbind_v2020_casf2016/processed_manifest.csv \
+  --checkpoint runs/base/best.pt \
+  --split test --adaptive --max-recycles 16 \
+  --out runs/base/adaptive.json
+```
+
+Instead of one depth for every complex, this runs the cycle budget once, records each cycle's readout and each
+complex's own state change, then stops every complex where it converges. The model is deterministic in eval mode and
+the cycles are sequential, so reading out at cycle `t` is identical to a fixed run with `--recycles t`; one pass
+therefore yields every fixed-T result plus any stopping policy over the same trajectory. Reported per policy: RMSE,
+MAE, Pearson, Spearman, mean and median cycles spent, and the share of complexes that never converged. The label-using
+per-complex optimum is printed as an explicit upper bound, not as a result.
 
 ## First ablations
 

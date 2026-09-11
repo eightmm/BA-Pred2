@@ -18,15 +18,15 @@ import yaml
 CSS = """
 :root {
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7;
-  --border: rgba(11,11,11,0.10); --s1: #2a78d6; --s2: #eb6834; --s1-wash: rgba(42,120,214,0.10); --good: #006300;
+  --border: rgba(11,11,11,0.10); --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s1-wash: rgba(42,120,214,0.10); --good: #006300;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
-  --border: rgba(255,255,255,0.10); --s1: #3987e5; --s2: #d95926; --s1-wash: rgba(57,135,229,0.14); --good: #0ca30c;
+  --border: rgba(255,255,255,0.10); --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s1-wash: rgba(57,135,229,0.14); --good: #0ca30c;
 } }
 :root[data-theme="dark"] {
   --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
-  --border: rgba(255,255,255,0.10); --s1: #3987e5; --s2: #d95926; --s1-wash: rgba(57,135,229,0.14); --good: #0ca30c;
+  --border: rgba(255,255,255,0.10); --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s1-wash: rgba(57,135,229,0.14); --good: #0ca30c;
 }
 body { background: var(--page); color: var(--ink); font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14.5px; line-height: 1.55; }
 main { max-width: 1120px; margin: 0 auto; padding: 32px 22px 56px; display: flex; flex-direction: column; gap: 32px; }
@@ -56,6 +56,10 @@ section { display: flex; flex-direction: column; gap: 12px; }
 .legend { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink2); font-weight: 400; }
 .legend i { display: inline-block; width: 14px; height: 2px; background: var(--s1); border-radius: 1px; margin-left: 8px; }
 .legend i.k2 { background: var(--s2); }
+.legend i.k3 { background: var(--s3); }
+svg.chart .pt.s2 { fill: var(--s2); }
+svg.chart .pt.s3 { fill: var(--s3); }
+svg.chart .line.s3 { stroke: var(--s3); }
 svg.chart { width: 100%; height: auto; display: block; font-family: inherit; }
 svg.chart text { fill: var(--ink2); font-size: 11px; }
 svg.chart .grid { stroke: var(--grid); stroke-width: 1; }
@@ -206,6 +210,50 @@ def scatter_svg(lo: float, hi: float, size: int = 440) -> tuple[str, dict]:
     return "".join(parts), scale
 
 
+def compute_curve_svg(fixed: dict, adaptive: dict) -> str:
+    """Accuracy against cycles actually spent (SPEC 18): the fixed-T curve, with each adaptive
+    stopping policy placed at the mean number of cycles it used."""
+    W, H, ML, MR, MT, MB = 470, 260, 46, 20, 14, 34
+    pts_fixed = [(float(t), fixed[t]["rmse"], f"fixed T={t}") for t in sorted(fixed, key=int)]
+    rules = [("pred_delta", "s2"), ("state_delta", "s3")]
+    pts_adaptive = []
+    for rule, cls in rules:
+        for eps, r in adaptive.get(rule, {}).items():
+            pts_adaptive.append((r["mean_cycles"], r["rmse"], f"{rule} eps={eps}", cls, r["median_cycles"]))
+    xs = [p[0] for p in pts_fixed] + [p[0] for p in pts_adaptive]
+    ys = [p[1] for p in pts_fixed] + [p[1] for p in pts_adaptive]
+    x0, x1 = 0.0, max(xs) * 1.04
+    yt = nice_ticks(min(ys), max(ys), 4)
+    y0, y1 = yt[0], yt[-1]
+
+    def sx(v):
+        return ML + (W - ML - MR) * (v - x0) / max(x1 - x0, 1e-9)
+
+    def sy(v):
+        return MT + (H - MT - MB) * (1 - (v - y0) / max(y1 - y0, 1e-9))
+
+    out = [f'<svg class="chart" viewBox="0 0 {W} {H}" role="img" aria-label="RMSE against the number of recurrent cycles spent">']
+    for t in yt:
+        out.append(f'<line class="grid" x1="{ML}" x2="{W - MR}" y1="{sy(t):.1f}" y2="{sy(t):.1f}"/><text x="{ML - 6}" y="{sy(t) + 3.5:.1f}" text-anchor="end">{t:g}</text>')
+    out.append(f'<line class="axis" x1="{ML}" x2="{W - MR}" y1="{H - MB}" y2="{H - MB}"/>')
+    for v in range(0, int(x1) + 1, 4):
+        out.append(f'<text x="{sx(v):.1f}" y="{H - MB + 15}" text-anchor="middle">{v}</text>')
+    out.append(f'<text x="{(ML + W - MR) / 2:.1f}" y="{H - 3}" text-anchor="middle">cycles spent (mean)</text>')
+    out.append('<path class="line" d="M' + " L".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y, _ in pts_fixed) + '"/>')
+    for x, y, label in pts_fixed:
+        out.append(f'<circle class="hit" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="10" data-tip="{label} | RMSE {y:.3f}"/>')
+    for x, y, label, cls, med in pts_adaptive:
+        out.append(f'<circle class="pt {cls}" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="4.5"/>')
+        out.append(f'<circle class="hit" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="11" data-tip="{label} | RMSE {y:.3f} | mean {x:.2f} cycles, median {med:g}"/>')
+    best_t = min(fixed, key=lambda k: fixed[k]["rmse"])
+    bx, by = sx(float(best_t)), sy(fixed[best_t]["rmse"])
+    out.append(f'<circle class="ring" cx="{bx:.1f}" cy="{by:.1f}" r="7"/>')
+    anchor = "end" if bx > W * 0.62 else "start"
+    out.append(f'<text class="lbl" x="{bx + (-10 if anchor == "end" else 10):.1f}" y="{by + 20:.1f}" text-anchor="{anchor}">best fixed T={best_t} ({fixed[best_t]["rmse"]:.3f})</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
 def card(title: str, chart: Line) -> str:
     leg = ""
     if chart.legend:
@@ -345,6 +393,45 @@ def build(run_dir: Path, title: str) -> str:
         parts.append('<p class="pending">학습이 끝나면 best.pt로 T = 1, 2, 3, 4, 6, 8, 12, 16 sweep을 돌립니다.</p>')
     parts.append("</section>")
 
+    # ---- adaptive early exit
+    adaptive = load_json(run_dir / "adaptive.json")
+    if adaptive:
+        fx, ad = adaptive["fixed"], adaptive["adaptive"]
+        bf = adaptive["best_fixed_T"]
+        parts.append("<section><h2>컴플렉스별 조기 종료 (per-complex early exit)</h2>")
+        parts.append("<p>한 번의 forward에서 cycle마다 readout과 상태 변화량을 기록한 뒤, 각 컴플렉스를 자기 수렴 시점에서 멈춥니다. "
+                     "모델이 결정적이므로 cycle t에서 멈춘 값은 T=t로 돌린 값과 정확히 같습니다. "
+                     "가로축은 실제로 쓴 cycle 수라서 정확도와 연산량을 한 그림에서 비교할 수 있습니다. "
+                     "세로축은 좁게 잡혀 있습니다. 실제 차이의 크기는 오른쪽 fixed-T 전체 폭으로 확인하십시오.</p>")
+        legend = '<span class="legend"><i></i>fixed T<i class="k2"></i>stop on |Δpred|<i class="k3"></i>stop on Δstate</span>'
+        spread = max(v["rmse"] for v in fx.values()) - min(v["rmse"] for v in fx.values())
+        best_ad = min(((rule, eps, r) for rule, e in ad.items() for eps, r in e.items()), key=lambda x: x[2]["rmse"])
+        cheapest = min(((rule, eps, r) for rule, e in ad.items() for eps, r in e.items() if r["rmse"] <= fx[bf]["rmse"] + 0.005), key=lambda x: x[2]["mean_cycles"], default=None)
+        summary = [f'<dt>best fixed</dt><dd>T={bf} · RMSE {fx[bf]["rmse"]:.3f}</dd>',
+                   f'<dt>best adaptive</dt><dd>{best_ad[0]} ε={best_ad[1]} · RMSE {best_ad[2]["rmse"]:.3f} · {best_ad[2]["mean_cycles"]:.2f} cycles</dd>']
+        if cheapest:
+            summary.append(f'<dt>같은 정확도 최소 연산</dt><dd>{cheapest[0]} ε={cheapest[1]} · {cheapest[2]["mean_cycles"]:.2f} cycles</dd>')
+        summary += [f'<dt>fixed-T 전체 폭</dt><dd>RMSE {spread:.3f} (T=1…{adaptive["max_recycles"]})</dd>',
+                    f'<dt>oracle 상한</dt><dd>RMSE {adaptive["oracle_per_complex_T"]["rmse"]:.3f} (라벨 사용)</dd>']
+        parts.append('<div class="scatter-wrap"><div class="card">'
+                     f'<h3>RMSE vs 쓴 cycle 수{legend}</h3>{compute_curve_svg(fx, ad)}<div class="tip"></div></div>'
+                     f'<dl class="kv">{"".join(summary)}</dl></div>')
+        rows = []
+        for rule, entries in ad.items():
+            for eps, r in entries.items():
+                rows.append([f"{rule} ε={eps}", fmt(r["rmse"]), fmt(r["mae"]), fmt(r["pearson"]), fmt(r["spearman"]),
+                             fmt(r["mean_cycles"], 2), fmt(r["median_cycles"], 0), f"{r['max_cycles_hit_frac']:.0%}"])
+        rows.append([f"best fixed T={bf}", fmt(fx[bf]["rmse"]), fmt(fx[bf]["mae"]), fmt(fx[bf]["pearson"]), fmt(fx[bf]["spearman"]), bf, bf, "–"])
+        o = adaptive["oracle_per_complex_T"]
+        rows.append(["oracle (라벨 사용, 도달 불가)", fmt(o["rmse"]), fmt(o["mae"]), fmt(o["pearson"]), fmt(o["spearman"]), fmt(o["mean_cycles"], 2), fmt(o["median_cycles"], 0), "–"])
+        parts.append("<details open><summary>stopping policy table</summary>" + table(["policy", "RMSE", "MAE", "Pearson", "Spearman", "mean cycles", "median", "hit max"], rows) + "</details>")
+        m = adaptive["prediction_movement"]
+        parts.append(f'<p>예측은 cycle에 따라 실제로 움직입니다. 첫 cycle에서 마지막 cycle까지 평균 {m["mean_abs_first_to_last"]:.3f} pKd, '
+                     f'중앙값 {m["median_abs_first_to_last"]:.3f} pKd입니다. 다만 이동량과 첫 cycle 오차의 상관은 '
+                     f'{m["corr_movement_vs_error_at_T1"]:+.3f}로 사실상 0이라, 많이 움직이는 컴플렉스가 어려운 컴플렉스는 아닙니다. '
+                     f'즉 지금 상태 변화량은 "얼마나 더 계산해야 하는지"를 알려주는 신호가 아닙니다.</p>')
+        parts.append("</section>")
+
     # ---- scatter
     parts.append("<section><h2>예측 vs 실험 pKd (CASF-2016 core, 285 complexes)</h2>")
     pred_sets = {}
@@ -422,6 +509,21 @@ JS = r"""
     };
     hit.addEventListener('pointermove', show);
     hit.addEventListener('pointerleave', () => { tip.style.display = 'none'; xhair.style.opacity = 0; });
+  });
+
+  document.querySelectorAll('svg.chart [data-tip]').forEach(el => {
+    const card = el.closest('.card'); const tip = card.querySelector('.tip');
+    const show = ev => {
+      tip.replaceChildren();
+      const parts = el.dataset.tip.split('|');
+      parts.forEach((t, i) => { const d = document.createElement('div'); if (i === 0) d.className = 'n'; d.textContent = t.trim(); tip.appendChild(d); });
+      tip.style.display = 'block';
+      const cr = card.getBoundingClientRect();
+      let lx = ev.clientX - cr.left + 12; if (lx + 190 > cr.width) lx = ev.clientX - cr.left - 190;
+      tip.style.left = lx + 'px'; tip.style.top = (ev.clientY - cr.top + 10) + 'px';
+    };
+    el.addEventListener('pointerenter', show);
+    el.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
   });
 
   if (D.preds) {

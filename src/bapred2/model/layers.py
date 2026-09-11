@@ -78,7 +78,7 @@ class IntraPropagation(nn.Module):
 class RecurrentBindingBlock(nn.Module):
     """One shared cycle: interface refinement -> cross message -> intra propagation."""
 
-    def __init__(self, dim: int, dropout: float, layerscale_init: float, use_endpoint_context: bool = True, node_update: str = "residual", bounded_scale: bool = False):
+    def __init__(self, dim: int, dropout: float, layerscale_init: float, use_endpoint_context: bool = True, node_update: str = "residual", bounded_scale: bool = False, q_candidate_norm: bool = False):
         super().__init__()
         self.use_endpoint_context = use_endpoint_context
         self.node_update = node_update
@@ -89,6 +89,9 @@ class RecurrentBindingBlock(nn.Module):
         q_in_dim = dim * (6 if use_endpoint_context else 4)
         self.q_candidate = MLP(q_in_dim, dim * 2, dim, dropout)
         self.q_gate = nn.Linear(q_in_dim, dim)
+        # Interpolation keeps q between its old value and the candidate, so the candidate's own scale sets the
+        # interface state's scale; normalising it stops ||q|| drifting upward across cycles.
+        self.q_cand_norm = nn.LayerNorm(dim) if q_candidate_norm else None
         self.q_scale = init_scale(dim, layerscale_init, bounded_scale)
         self.pl_score = MLP(dim * 3, dim, 1, dropout)
         self.lp_score = MLP(dim * 3, dim, 1, dropout)
@@ -119,6 +122,8 @@ class RecurrentBindingBlock(nn.Module):
             pieces += [pctx[pidx], lctx[lidx]]
         qu = torch.cat(pieces, dim=-1)
         qcand = self.q_candidate(qu)
+        if self.q_cand_norm is not None:
+            qcand = self.q_cand_norm(qcand)
         qgate = torch.sigmoid(self.q_gate(qu))
         q = q + scale_gain(self.q_scale, self.bounded_scale) * qgate * (qcand - q)
         qn = self.q_norm(q)

@@ -128,3 +128,35 @@ item 1 is fixed, concatenating the flags and a residue embedding into `x` is a o
 
 Items 1-2 change preprocessing and the checkpoint format; run them as a new config (`bapred2_v0.2.yaml`)
 so `runs/base` remains the Milestone-0 reference.
+
+
+---
+
+## Addendum (2026-09-11): what the trained runs and per-complex early exit showed
+
+Measured on the three finished runs (`bapred2-eval --adaptive --max-recycles 16`, CASF-2016 core, n = 285).
+
+**The recurrence is not idle, it is directionless.** Aggregate RMSE barely moves with T, but individual predictions
+do: from cycle 1 to cycle 16 a complex's prediction moves by 0.41 pKd on average in `base` (median 0.34, 97 of 285
+complexes move more than 0.5), 0.30 in v0.2a and 0.27 in v0.2b. The movement simply does not point at the answer -
+the correlation between how far a complex moves and how wrong it was at cycle 1 is +0.02 / +0.09 / +0.03. Splitting
+by movement makes it explicit: in `base` the high-movement half goes from RMSE 1.304 at T=1 to 1.338 at T=16 while
+the low-movement half stays flat. Extra cycles hurt exactly the complexes that use them.
+
+**Per-complex early exit therefore cannot pay off yet.** Every stopping rule and threshold lands at or above the best
+fixed T: `base` 1.348 fixed vs 1.348-1.371 adaptive, v0.2a 1.242 vs 1.243-1.290, v0.2b 1.282 vs 1.277-1.292. What
+adaptive stopping does do is find the cheap operating point without being told: v0.2a matches its best fixed result
+(RMSE 1.243 vs 1.242) at a mean of 1.09 cycles, and `base` matches its own (1.348) at 1.99 cycles.
+
+**The stability work did make the convergence signal usable.** In `base` the state delta never falls below ~0.3, so
+any smaller threshold pins every complex at the cycle budget (100 % hit-max). In v0.2b the same rule at eps = 0.1
+spreads complexes over a mean of 6.9 cycles with nothing hitting the budget and accuracy unchanged. Bounded states
+are what turn "delta below a threshold" into a real convergence criterion, even though they did not move accuracy.
+
+**Consequence for the design.** Early exit is an inference policy over intermediate readouts, and intermediate
+readouts are never trained - only the final cycle's readout receives a gradient. `train.cycle_loss_weight` (weight
+t/T on each cycle's loss) is the missing piece; `model.q_candidate_norm` closes the drift that moved from the node
+states to the interface state in v0.2b. Both are wired into `configs/bapred2_v0.3.yaml`. The honest reading of the
+oracle numbers (1.11-1.16 against 1.24-1.35 achieved) is that they are a selection over drift noise, not reachable
+headroom: the label-chosen cycle is either the first or the last for 54 % of complexes, the U-shape you get when a
+trajectory wanders rather than converges.

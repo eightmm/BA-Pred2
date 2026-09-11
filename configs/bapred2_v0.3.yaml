@@ -1,0 +1,48 @@
+# v0.3 = v0.2b data and stability changes, plus the two things the v0.2 evaluation showed were missing:
+#   - cycle_loss_weight: every cycle's readout is trained (weighted t/T), so an intermediate cycle is a valid
+#     answer and per-complex early exit becomes a meaningful operating point rather than a re-run of a fixed T.
+#   - q_candidate_norm: v0.2b fixed node drift but moved it to the interface state (||q|| 19 -> 42 over 16 cycles).
+# core_dropout returns to 0.10 because v0.2b overfit harder than v0.2a (train loss 0.006 vs 0.010).
+graph:
+  pocket_cutoff: 8.0
+  interface_cutoff: 5.0
+  protein_spatial_cutoff: 5.0
+  ligand_spatial_cutoff: 4.5
+  max_spatial_neighbors: 32
+  distance_rbf_dim: 16
+  rwpe_dim: 20
+  protein_tokens: true
+  node_chem_flags: true
+  drop_water: true
+
+model:
+  hidden_dim: 256
+  prelude_layers: 1
+  dropout: 0.10
+  layerscale_init: 0.10
+  use_endpoint_context: true
+  train_recycles: [2, 3, 4, 6, 8]
+  train_recycle_probs: [0.25, 0.25, 0.20, 0.20, 0.10]
+  eval_recycles: 6
+  protein_tokens: true
+  node_update: interpolate
+  bounded_scale: true
+  pre_readout_norm: true
+  readout_norm: block
+  core_dropout: 0.10
+  q_candidate_norm: true
+
+train:
+  seed: 42
+  batch_size: 16
+  num_workers: 4
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.00001
+  grad_clip: 5.0
+  loss: huber
+  huber_delta: 1.0
+  amp: true
+  amp_dtype: bfloat16
+  early_stop_patience: 20
+  cycle_loss_weight: 0.5
